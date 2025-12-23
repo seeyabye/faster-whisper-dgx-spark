@@ -1,0 +1,17 @@
+services:
+  whisper:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: whisper-test-whisper
+    command: uvicorn docker.server:app --host 0.0.0.0 --port 8000
+    entrypoint: ["/app/docker/entrypoint.sh"]
+    ports:
+      - "8002:8000"
+    volumes:
+      - ./:/app
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]

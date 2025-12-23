@@ -1,0 +1,4 @@
+.venv/
+model_cache/
+docker/__pycache__/
+
