@@ -69,16 +69,21 @@ def tokens_to_words(tokens):
     return words
 
 
-def words_to_segments(words, full_text=""):
-    """Split words into segments by sentence-ending punctuation.
+def words_to_segments(words, full_text="", pause_threshold=0.5):
+    """Split words into segments by sentence-ending punctuation OR pauses.
 
-    Creates segments at '.', '?', '!' boundaries. Each segment's first
-    word is normalized to remove any leading space so that
-    ''.join(w['word']) reproduces segment.text exactly.
+    Creates segments at '.', '?', '!' boundaries, OR when the gap between
+    consecutive words exceeds pause_threshold (default 0.5s). This handles
+    cases where the model drops punctuation between speakers or during
+    silence gaps (e.g. "But how Thoros?" -> "But how?" + "Thoros?").
+
+    Each segment's first word is normalized to remove any leading space so
+    that ''.join(w['word']) reproduces segment.text exactly.
     """
     segments = []
     current_words = []
     current_start = None
+    prev_end = None
     seg_id = 0
 
     def _flush(words_list, start_val, sid):
@@ -97,9 +102,20 @@ def words_to_segments(words, full_text=""):
         }
 
     for w in words:
+        # Check for pause-based split (gap between previous word end
+        # and current word start exceeds threshold)
+        if prev_end is not None and current_words:
+            gap = w["start"] - prev_end
+            if gap >= pause_threshold:
+                segments.append(_flush(current_words, current_start, seg_id))
+                seg_id += 1
+                current_words = []
+                current_start = None
+
         if current_start is None:
             current_start = w["start"]
         current_words.append(w)
+        prev_end = w["end"]
 
         wt = w["word"].rstrip()
         if wt.endswith(".") or wt.endswith("?") or wt.endswith("!"):
@@ -107,6 +123,7 @@ def words_to_segments(words, full_text=""):
             seg_id += 1
             current_words = []
             current_start = None
+            prev_end = None
 
     if current_words:
         segments.append(_flush(current_words, current_start, seg_id))

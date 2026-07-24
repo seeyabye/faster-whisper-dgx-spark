@@ -135,6 +135,71 @@ def test_segment_first_word_no_leading_space():
         assert concat == seg["text"], f"mismatch: {concat!r} vs {seg['text']!r}"
 
 
+def test_pause_based_segment_split():
+    """When the gap between words exceeds pause_threshold (0.5s),
+    split into a new segment even without punctuation."""
+    words = [
+        {"word": "But", "start": 2.64, "end": 2.96, "probability": 1.0},
+        {"word": " how", "start": 2.96, "end": 3.28, "probability": 1.0},
+        # 1.28s gap (no punctuation, but speaker change)
+        {"word": " Thoros", "start": 4.56, "end": 5.28, "probability": 1.0},
+        {"word": "?", "start": 5.28, "end": 5.28, "probability": 1.0},
+    ]
+    segs = words_to_segments(words, pause_threshold=0.5)
+    assert len(segs) == 2, f"expected 2 segments, got {len(segs)}"
+    assert segs[0]["text"] == "But how"
+    assert segs[1]["text"] == "Thoros?"
+    # Verify text reconstruction
+    for seg in segs:
+        concat = "".join(w["word"] for w in seg["words"])
+        assert concat == seg["text"], f"mismatch: {concat!r} vs {seg['text']!r}"
+
+
+def test_pause_below_threshold_no_split():
+    """Gaps below threshold should NOT trigger a split."""
+    words = [
+        {"word": "Hello", "start": 0.0, "end": 0.5, "probability": 1.0},
+        {"word": " world", "start": 0.7, "end": 1.0, "probability": 1.0},  # 0.2s gap
+    ]
+    segs = words_to_segments(words, pause_threshold=0.5)
+    assert len(segs) == 1, f"expected 1 segment, got {len(segs)}"
+
+
+def test_pause_and_punctuation_combined():
+    """Both pause and punctuation should create segment boundaries."""
+    words = [
+        {"word": "Hello", "start": 0.0, "end": 0.5, "probability": 1.0},
+        {"word": " world.", "start": 0.7, "end": 1.0, "probability": 1.0},
+        # 1.0s gap + new segment
+        {"word": " How", "start": 2.0, "end": 2.3, "probability": 1.0},
+        {"word": " are", "start": 2.3, "end": 2.5, "probability": 1.0},
+        {"word": " you?", "start": 2.5, "end": 3.0, "probability": 1.0},
+    ]
+    segs = words_to_segments(words, pause_threshold=0.5)
+    assert len(segs) == 2
+    assert segs[0]["text"] == "Hello world."
+    assert segs[1]["text"] == "How are you?"
+
+
+def test_pause_catch_missing_punctuation():
+    """Model drops period between speakers — pause-based split fixes it."""
+    # "You can't" + "Enough!" merged because model dropped the period
+    words = [
+        {"word": "You", "start": 6.72, "end": 6.80, "probability": 1.0},
+        {"word": " can", "start": 6.80, "end": 6.88, "probability": 1.0},
+        {"word": "'", "start": 6.88, "end": 6.88, "probability": 1.0},
+        {"word": "t", "start": 6.96, "end": 6.96, "probability": 1.0},
+        # 0.32s gap — below default 0.5s threshold, use 0.3s
+        {"word": " en", "start": 7.28, "end": 7.52, "probability": 1.0},
+        {"word": "ough", "start": 7.52, "end": 7.76, "probability": 1.0},
+        {"word": "!", "start": 7.76, "end": 7.76, "probability": 1.0},
+    ]
+    segs = words_to_segments(words, pause_threshold=0.3)
+    assert len(segs) == 2, f"expected 2 segments, got {len(segs)}"
+    assert segs[0]["text"] == "You can't"
+    assert segs[1]["text"] == "enough!"
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
