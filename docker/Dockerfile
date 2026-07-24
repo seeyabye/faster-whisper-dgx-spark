@@ -41,6 +41,7 @@ RUN python3 -m pip uninstall -y ctranslate2 && \
     python3 -m pip install .
 
 COPY docker/server.py /app/server.py
+COPY docker/timing.py /app/timing.py
 COPY docker/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 

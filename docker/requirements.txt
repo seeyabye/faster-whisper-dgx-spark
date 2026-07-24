@@ -1,5 +1,19 @@
-faster-whisper
-fastapi
-uvicorn[standard]
-python-multipart
+# Direct dependencies for whisper-fw.
+# Pinned to the versions verified working in the container (2026-07-24).
+#
+# NOTE: torch/torchaudio/torchvision use the +cu130 local-version tag and
+# must be installed from the PyTorch cu130 index, NOT plain PyPI. The
+# Dockerfile uses --extra-index-url for this. Transitive deps are not
+# pinned here; use requirements-full-freeze.txt (142 packages, the full
+# pip freeze from the container) for a bit-exact reproduction.
+#
+# CTranslate2 is installed separately in the Dockerfile (built from source
+# with CUDA; the pip wheel would not match the custom CUDA build).
 
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+faster-whisper==1.2.1
+whisperx==3.8.6
+fastapi==0.139.2
+uvicorn[standard]==0.51.0
+python-multipart==0.0.32
