@@ -1,17 +1,23 @@
 services:
   whisper:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
     image: whisper-test-whisper
-    command: uvicorn docker.server:app --host 0.0.0.0 --port 8000
-    entrypoint: ["/app/docker/entrypoint.sh"]
+    container_name: whisper-fw
+    environment:
+      - FW_MODEL=large-v3
+      - FW_DEVICE=cuda
+      - FW_COMPUTE_TYPE=float16
+      - HF_HOME=/root/.cache/huggingface
     ports:
       - "8002:8000"
     volumes:
-      - ./:/app
+      - ~/.cache/huggingface:/root/.cache/huggingface
     deploy:
       resources:
         reservations:
           devices:
-            - capabilities: [gpu]
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    command: uvicorn server:app --host 0.0.0.0 --port 8000
+    entrypoint: ["/app/entrypoint.sh"]
