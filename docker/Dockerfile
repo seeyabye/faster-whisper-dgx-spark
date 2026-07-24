@@ -58,6 +58,7 @@ RUN python3 -m pip install -r /app/requirements.txt
 
 COPY docker/server.py /app/server.py
 COPY docker/timing.py /app/timing.py
+COPY docker/parakeet.py /app/parakeet.py
 COPY docker/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
