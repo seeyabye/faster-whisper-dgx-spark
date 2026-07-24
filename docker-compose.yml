@@ -1,6 +1,6 @@
 services:
   whisper:
-    image: whisper-test-whisper
+    image: whisper-fw:624bc50
     container_name: whisper-fw
     environment:
       - FW_MODEL=large-v3

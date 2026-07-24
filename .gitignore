@@ -1,4 +1,8 @@
 .venv/
+__pycache__/
+*.py[cod]
 model_cache/
 docker/__pycache__/
-
+*.egg-info/
+.env
+.DS_Store
