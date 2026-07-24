@@ -158,7 +158,7 @@ def test_build_result_ok_when_text_matches():
              {"word": " world.", "start": 0.5, "end": 1.0, "score": 0.9},
          ]},
     ]}
-    segs, ok = build_result_from_whisperx(aligned)
+    segs, ok, _ = build_result_from_whisperx(aligned)
     assert ok is True
     assert len(segs) == 1
     assert segs[0]["words"][0]["word"] == "hello"
@@ -178,10 +178,103 @@ def test_build_result_ok_with_spacing_fix():
              {"word": "this.", "start": 1.0, "end": 1.2, "score": 0.9},
          ]},
     ]}
-    segs, ok = build_result_from_whisperx(aligned)
+    segs, ok, _ = build_result_from_whisperx(aligned)
     assert ok is True, "should match with spacing fix"
     reconstructed = "".join(w["word"] for w in segs[0]["words"])
     assert reconstructed == "wildlings do a thing like this."
+
+
+def test_build_result_per_segment_synthetic_words():
+    """Segments where alignment failed (no words) should get evenly-spaced
+    synthetic words so stable-ts doesn't drop them. ok=True (no whole-request
+    fallback). The synthetic words have probability=0.0.
+    """
+    aligned = {"segments": [
+        {"start": 0.0, "end": 1.0, "text": "hello world.",
+         "words": [
+             {"word": "hello", "start": 0.0, "end": 0.4, "score": 0.9},
+             {"word": " world.", "start": 0.5, "end": 1.0, "score": 0.9},
+         ]},
+        {"start": 1.5, "end": 2.5, "text": "failed alignment segment.",
+         "words": []},  # no words -> alignment failed
+        {"start": 3.0, "end": 4.0, "text": "back to normal.",
+         "words": [
+             {"word": "back", "start": 3.0, "end": 3.3, "score": 0.9},
+             {"word": " to", "start": 3.4, "end": 3.6, "score": 0.9},
+             {"word": " normal.", "start": 3.7, "end": 4.0, "score": 0.9},
+         ]},
+    ]}
+    segs, ok, synth = build_result_from_whisperx(aligned)
+    assert ok is True, "should not fall back when only some segments lack words"
+    assert synth == 1  # one segment used synthetic words
+    assert len(segs) == 3
+    assert len(segs[0]["words"]) == 2    # aligned
+    assert len(segs[1]["words"]) == 1    # single synthetic word spanning the segment
+    assert segs[1]["words"][0]["probability"] == 0.0  # synthetic marker
+    assert segs[1]["words"][0]["start"] == 1.5        # spans segment bounds
+    assert segs[1]["words"][0]["end"] == 2.5
+    # text reconstruction: single word IS the segment text
+    assert segs[1]["words"][0]["word"] == "failed alignment segment."
+    assert len(segs[2]["words"]) == 3    # aligned
+
+
+def test_build_result_missing_words_key_synthetic():
+    """WhisperX segment with no 'words' key at all -> synthetic words."""
+    aligned = {"segments": [
+        {"start": 0.0, "end": 1.0, "text": "no words key at all."},
+    ]}
+    segs, ok, synth = build_result_from_whisperx(aligned)
+    assert ok is True
+    assert synth == 1
+    assert len(segs) == 1
+    assert "words" in segs[0]
+    assert len(segs[0]["words"]) == 1  # single synthetic word
+    assert segs[0]["words"][0]["probability"] == 0.0
+    assert segs[0]["words"][0]["word"] == "no words key at all."
+
+
+def test_build_result_all_no_words_synthetic():
+    """All segments without words -> all get synthetic words, ok=True."""
+    aligned = {"segments": [
+        {"start": 0.0, "end": 1.0, "text": "first.", "words": []},
+        {"start": 1.5, "end": 2.5, "text": "second.", "words": []},
+    ]}
+    segs, ok, synth = build_result_from_whisperx(aligned)
+    assert ok is True
+    assert synth == 2
+    assert len(segs) == 2
+    assert all("words" in s and len(s["words"]) == 1 for s in segs)  # single synthetic word each
+
+
+def test_synthesize_words_rounding_collapse_returns_empty():
+    """If segment bounds round to zero duration, _synthesize_words_from_text
+    should return [] (fail safe) rather than emitting a zero-duration word.
+    build_result_from_whisperx will then omit the words key for that segment.
+    """
+    from timing import _synthesize_words_from_text
+    # bounds that round to the same millisecond
+    result = _synthesize_words_from_text("short.", 0.0001, 0.0002)
+    assert result == [], f"expected empty, got {result}"
+
+
+def test_synthesize_words_zero_duration_returns_empty():
+    """Zero-duration segment (start == end) -> empty (fail safe)."""
+    from timing import _synthesize_words_from_text
+    result = _synthesize_words_from_text("text.", 1.0, 1.0)
+    assert result == []
+
+
+def test_build_result_corruption_on_zero_duration_text_segment():
+    """A text-bearing segment with zero duration (synthesis fails) is
+    corruption -> whole-request fallback (ok=False), not silent drop.
+    """
+    aligned = {"segments": [
+        {"start": 0.0, "end": 0.0001, "text": "too short to synthesize.",
+         "words": []},
+    ]}
+    segs, ok, synth = build_result_from_whisperx(aligned)
+    assert ok is False, "zero-duration text segment should trigger fallback"
+    assert segs == []
 
 
 def test_build_result_fallback_on_text_mismatch():
@@ -193,7 +286,7 @@ def test_build_result_fallback_on_text_mismatch():
              {"word": " world", "start": 0.5, "end": 1.0, "score": 0.9},
          ]},
     ]}
-    segs, ok = build_result_from_whisperx(aligned)
+    segs, ok, synth = build_result_from_whisperx(aligned)
     assert ok is False
     assert segs == []
 
@@ -209,7 +302,7 @@ def test_build_result_ok_with_contraction():
              {"word": "this.", "start": 1.2, "end": 1.5, "score": 0.9},
          ]},
     ]}
-    segs, ok = build_result_from_whisperx(aligned)
+    segs, ok, _ = build_result_from_whisperx(aligned)
     assert ok is True
     reconstructed = "".join(w["word"] for w in segs[0]["words"])
     assert reconstructed == "I've never seen this."
@@ -227,7 +320,7 @@ def test_build_result_ok_with_punctuation():
              {"word": "you?", "start": 1.4, "end": 2.0, "score": 0.9},
          ]},
     ]}
-    segs, ok = build_result_from_whisperx(aligned)
+    segs, ok, _ = build_result_from_whisperx(aligned)
     assert ok is True
     reconstructed = "".join(w["word"] for w in segs[0]["words"])
     assert reconstructed == "Hello, world! How are you?"

@@ -157,8 +157,10 @@ async def _do_asr(audio_file, task, language, output):
         lang = language or info.language
 
         # Step 2: Align with WhisperX. Keep its words and its per-segment text.
-        # If alignment fails OR any text-bearing segment has no usable words,
-        # fall back the WHOLE request to faster-whisper words (no mixing).
+        # If alignment fails entirely, or text reconstruction fails (corruption),
+        # fall back the WHOLE request to faster-whisper words.
+        # Individual segments where alignment failed get a single synthetic
+        # word spanning the segment bounds (not whole-request fallback).
         result_segments = []
         try:
             aligned_segments = whisperx.align(
@@ -169,10 +171,12 @@ async def _do_asr(audio_file, task, language, output):
                 DEVICE,
                 return_char_alignments=False,
             )
-            result_segments, ok = build_result_from_whisperx(aligned_segments)
+            result_segments, ok, synth_count = build_result_from_whisperx(aligned_segments)
             if not ok or not result_segments:
-                print("[whisperx] incomplete words; falling back to faster-whisper words")
+                print("[whisperx] text reconstruction failed; falling back to faster-whisper words")
                 result_segments = build_result_from_faster_whisper(seg_list)
+            elif synth_count:
+                print(f"[whisperx] {synth_count}/{len(result_segments)} segments used synthetic words (alignment failed)")
         except Exception as e:
             print(f"[whisperx] Alignment failed: {e}, using faster-whisper words")
             result_segments = build_result_from_faster_whisper(seg_list)

@@ -147,6 +147,34 @@ def adapt_whisperx_words(words, seg_start, seg_end):
     return out if out else None
 
 
+def _synthesize_words_from_text(text, seg_start, seg_end):
+    """Generate a single synthetic word spanning the segment for failed
+    alignment. stable-ts DROPS segments that lack a non-empty words
+    array, so we must provide one. Using a SINGLE word spanning the full
+    segment bounds avoids inventing fake intra-segment timing boundaries
+    that stable-ts could split on — the segment passes through intact with
+    correct text and WhisperX's own timestamps.
+
+    probability=0.0 marks this as synthetic, not acoustically aligned.
+    """
+    if not text.strip():
+        return []
+    s_r = round(seg_start, 3)
+    e_r = round(seg_end, 3)
+    # Fail safe if rounding collapses to zero/negative duration.
+    # The caller (build_result_from_whisperx) treats an empty result for
+    # a text-bearing segment as corruption and triggers whole-request
+    # faster-whisper fallback (no silent dialogue loss).
+    if e_r <= s_r:
+        return []
+    return [{
+        "word": text,
+        "start": s_r,
+        "end": e_r,
+        "probability": 0.0,
+    }]
+
+
 def _text_matches(words_text, seg_text):
     """Check whether concatenated word strings exactly reproduce the segment text.
 
@@ -166,34 +194,59 @@ def build_result_from_whisperx(aligned_segments):
     Uses each aligned segment's OWN text (no index remapping into
     faster-whisper's different segmentation) and includes the words array.
 
-    Returns (result_segments, ok). ok is False if ANY text-bearing segment
-    could not produce valid words, OR if the concatenated word strings do
-    not reproduce the segment text (stable-ts rebuilds text from words).
-    The caller then falls back the WHOLE request to faster-whisper words,
-    never mixing the two segmentations.
+    Per-segment handling (NOT whole-request fallback):
+    - Segments with valid aligned words: include words (after adaptation +
+      exact text reconstruction check). stable-ts regroups/splits these.
+    - Segments where alignment failed (no usable words): include a single
+      synthetic word spanning the segment bounds. stable-ts DROPS segments
+      that lack a non-empty words array, so we must provide one. Using a
+      single word avoids inventing fake intra-segment timing boundaries.
+    - Segments where words exist but text reconstruction FAILS: this is
+      corruption (not just missing alignment) -> return ok=False to trigger
+      whole-request faster-whisper fallback.
+
+    Returns (result_segments, ok, synth_count). synth_count is the number
+    of segments that used synthetic words (for observability/logging only;
+    not encoded in the payload).
+
+    This keeps WhisperX's segmentation as the primary path. Only failed-
+    alignment segments use synthetic words, rather than discarding all
+    aligned segments when a few fail.
     """
     result_segments = []
+    synth_count = 0
     asg = aligned_segments.get("segments", [])
     for i, seg in enumerate(asg):
         seg_start = float(seg.get("start", 0.0))
         seg_end = float(seg.get("end", seg_start))
         text = seg.get("text", "")
         words = adapt_whisperx_words(seg.get("words") or [], seg_start, seg_end)
-        if words is None and text.strip():
-            return [], False
         if words and text.strip():
             # fail-safe: word concatenation must reproduce segment text
             words_text = "".join(w["word"] for w in words)
             if not _text_matches(words_text, text):
-                return [], False
-        result_segments.append({
+                return [], False, 0
+        # When adaptation failed (words is None) but the segment has text,
+        # generate a single synthetic word spanning the segment bounds.
+        # stable-ts DROPS segments that lack a non-empty words array.
+        # If synthesis fails (e.g. zero-duration segment after rounding),
+        # the segment cannot be preserved -> treat as corruption -> whole-
+        # request fallback.
+        if words is None and text.strip():
+            words = _synthesize_words_from_text(text, seg_start, seg_end)
+            if not words:
+                return [], False, 0
+            synth_count += 1
+        seg_out = {
             "id": i,
             "start": round(seg_start, 3),
             "end": round(seg_end, 3),
             "text": text,
-            "words": words or [],
-        })
-    return result_segments, True
+        }
+        if words:
+            seg_out["words"] = words
+        result_segments.append(seg_out)
+    return result_segments, True, synth_count
 
 
 def build_result_from_faster_whisper(seg_list):
