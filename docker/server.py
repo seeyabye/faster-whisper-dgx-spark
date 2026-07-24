@@ -1,9 +1,9 @@
-import os
-import tempfile
+import os, tempfile, json, re
 from typing import Optional
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse, PlainTextResponse
 from faster_whisper import WhisperModel
+import whisperx
 
 MODEL_NAME = os.getenv("FW_MODEL", "large-v3")
 DEVICE = os.getenv("FW_DEVICE", "cuda")
@@ -14,13 +14,25 @@ print(f"Loading model: {MODEL_NAME} on {DEVICE} ({COMPUTE_TYPE})")
 model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=COMPUTE_TYPE)
 print("Model loaded!")
 
+print("Loading WhisperX alignment model (GPU)...")
+align_model, align_metadata = whisperx.load_align_model(
+    language_code="en",
+    device=DEVICE,
+    model_name="WAV2VEC2_ASR_BASE_960H",
+)
+print("WhisperX alignment model loaded on GPU!")
+
 @app.get("/health")
 def health():
     return {"status": "ok", "model": MODEL_NAME, "device": DEVICE, "compute_type": COMPUTE_TYPE}
 
 @app.get("/status")
 def status():
-    return {"version": "faster-whisper server, model=" + MODEL_NAME}
+    return {"version": "faster-whisper + whisperx (no words), model=" + MODEL_NAME}
+
+@app.get("/v1/models")
+def list_models():
+    return {"object": "list", "data": [{"id": "whisper-large-v3", "object": "model", "created": 0, "owned_by": "faster-whisper"}]}
 
 @app.post("/asr")
 async def asr(
@@ -31,42 +43,121 @@ async def asr(
     encode: str = Form(default="false"),
     video_file: Optional[str] = Form(default=None),
 ):
+    return await _do_asr(audio_file, task, language, output)
+
+@app.post("/v1/audio/transcriptions")
+async def openai_transcribe(
+    file: UploadFile = File(...),
+    model: str = Form(default="whisper-large-v3"),
+    language: Optional[str] = Form(default=None),
+    task: str = Form(default="transcribe"),
+    response_format: str = Form(default="json"),
+):
+    output = "json" if response_format in ("json", "text") else "srt"
+    return await _do_asr(file, task, language, output)
+
+
+def _seconds_to_srt_timecode(seconds):
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds - int(seconds)) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+async def _do_asr(audio_file, task, language, output):
     suffix = os.path.splitext(audio_file.filename or "audio.wav")[1] or ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp_path = tmp.name
         tmp.write(await audio_file.read())
     try:
+        # Step 1: Transcribe with faster-whisper (no word timestamps)
+        # This gives us properly capitalized text
         segments, info = model.transcribe(
-            tmp_path, language=language, task=task, beam_size=5,
+            tmp_path,
+            language=language,
+            task=task,
+            beam_size=5,
             vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 500, "speech_pad_ms": 200},
-            condition_on_previous_text=False,
-            no_speech_threshold=0.6, compression_ratio_threshold=2.4,
-            word_timestamps=False,
+            vad_parameters={
+                "min_silence_duration_ms": 500,
+                "speech_pad_ms": 200,
+            },
         )
+
         seg_list = []
         text_parts = []
         for s in segments:
-            seg_list.append({"start": round(s.start, 3), "end": round(s.end, 3), "text": s.text})
-            text_parts.append(s.text)
-        full_text = "".join(text_parts).strip()
+            seg_list.append({
+                "start": s.start,
+                "end": s.end,
+                "text": s.text.strip(),
+            })
+            text_parts.append(s.text.strip())
+
+        full_text = " ".join(text_parts).strip()
+        lang = language or info.language
+
+        # Step 2: Align with WhisperX for accurate segment timestamps
+        # But do NOT return word-level data to stable-ts
+        try:
+            aligned_segments = whisperx.align(
+                seg_list,
+                align_model,
+                align_metadata,
+                tmp_path,
+                DEVICE,
+                return_char_alignments=False,
+            )
+
+            result_segments = []
+            for i, seg in enumerate(aligned_segments["segments"]):
+                # Use aligned timestamps but ORIGINAL text (with capitalization)
+                orig_text = seg_list[i]["text"] if i < len(seg_list) else seg.get("text", "")
+                result_segments.append({
+                    "id": i,
+                    "start": round(seg.get("start", seg_list[i]["start"] if i < len(seg_list) else 0), 3),
+                    "end": round(seg.get("end", seg_list[i]["end"] if i < len(seg_list) else 0), 3),
+                    "text": orig_text,
+                    # NO "words" field — stable-ts will use _default_text (fast path)
+                })
+        except Exception as e:
+            print(f"[whisperx] Alignment failed: {e}, using original segments")
+            result_segments = []
+            for i, s in enumerate(seg_list):
+                result_segments.append({
+                    "id": i,
+                    "start": round(s["start"], 3),
+                    "end": round(s["end"], 3),
+                    "text": s["text"],
+                })
+
         if output == "json":
             return JSONResponse({"text": full_text})
         elif output == "verbose_json":
-            return JSONResponse({"task": task, "language": info.language, "duration": round(seg_list[-1]["end"], 3) if seg_list else 0.0, "text": full_text, "segments": seg_list})
+            return JSONResponse({
+                "task": task,
+                "language": lang,
+                "duration": round(result_segments[-1]["end"], 3) if result_segments else 0.0,
+                "text": " ".join(s["text"] for s in result_segments),
+                "segments": result_segments,
+            })
         else:
             srt_lines = []
-            for i, s in enumerate(seg_list, 1):
+            for i, s in enumerate(result_segments, 1):
                 start_tc = _seconds_to_srt_timecode(s["start"])
                 end_tc = _seconds_to_srt_timecode(s["end"])
                 srt_lines.append(str(i))
                 srt_lines.append(start_tc + " --> " + end_tc)
-                srt_lines.append(s["text"].strip())
+                srt_lines.append(s["text"])
                 srt_lines.append("")
             return PlainTextResponse("\n".join(srt_lines))
     finally:
-        try: os.remove(tmp_path)
-        except OSError: pass
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
 
 @app.post("/detect-language")
 async def detect_language(
@@ -79,15 +170,21 @@ async def detect_language(
         tmp_path = tmp.name
         tmp.write(await audio_file.read())
     try:
-        segments, info = model.transcribe(tmp_path, beam_size=1, vad_filter=True)
-        return JSONResponse({"detected_language": info.language, "language_code": info.language, "language_probability": info.language_probability})
+        segments, info = model.transcribe(
+            tmp_path,
+            beam_size=1,
+            vad_filter=True,
+            vad_parameters={
+                "min_silence_duration_ms": 500,
+                "speech_pad_ms": 200,
+            },
+        )
+        return {
+            "detected_language": info.language,
+            "language_probability": round(info.language_probability, 3),
+        }
     finally:
-        try: os.remove(tmp_path)
-        except OSError: pass
-
-def _seconds_to_srt_timecode(seconds):
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    millis = int((seconds % 1) * 1000)
-    return "%02d:%02d:%02d,%03d" % (hours, minutes, secs, millis)
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
