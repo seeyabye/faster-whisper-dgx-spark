@@ -60,8 +60,9 @@ async def asr(
     output: str = Form(default="srt"),
     encode: str = Form(default="false"),
     video_file: Optional[str] = Form(default=None),
+    skip_align: bool = Query(default=False, description="Skip WhisperX alignment (A/B test)"),
 ):
-    return await _do_asr(audio_file, task, language, output)
+    return await _do_asr(audio_file, task, language, output, skip_align)
 
 
 @app.post("/v1/audio/transcriptions")
@@ -78,6 +79,7 @@ async def openai_transcribe(
     # OpenAI's top-level words array is NOT supported. Clients needing that
     # shape require a different server.
     timestamp_granularities: Optional[list[str]] = Form(default=None, alias="timestamp_granularities[]"),
+    skip_align: bool = Query(default=False, description="Skip WhisperX alignment (A/B test)"),
 ):
     if response_format == "verbose_json":
         output = "verbose_json"
@@ -85,7 +87,7 @@ async def openai_transcribe(
         output = "json"
     else:
         output = "srt"
-    return await _do_asr(file, task, language, output)
+    return await _do_asr(file, task, language, output, skip_align)
 
 
 @app.post("/detect-language")
@@ -119,7 +121,7 @@ async def detect_language(
             pass
 
 
-async def _do_asr(audio_file, task, language, output):
+async def _do_asr(audio_file, task, language, output, skip_align=False):
     suffix = os.path.splitext(audio_file.filename or "audio.wav")[1] or ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp_path = tmp.name
@@ -156,30 +158,34 @@ async def _do_asr(audio_file, task, language, output):
         full_text = " ".join(text_parts).strip()
         lang = language or info.language
 
-        # Step 2: Align with WhisperX. Keep its words and its per-segment text.
+        # Step 2: Align with WhisperX (unless skip_align for A/B testing).
         # If alignment fails entirely, or text reconstruction fails (corruption),
         # fall back the WHOLE request to faster-whisper words.
         # Individual segments where alignment failed get a single synthetic
         # word spanning the segment bounds (not whole-request fallback).
         result_segments = []
-        try:
-            aligned_segments = whisperx.align(
-                seg_list,
-                align_model,
-                align_metadata,
-                tmp_path,
-                DEVICE,
-                return_char_alignments=False,
-            )
-            result_segments, ok, synth_count = build_result_from_whisperx(aligned_segments)
-            if not ok or not result_segments:
-                print("[whisperx] text reconstruction failed; falling back to faster-whisper words")
-                result_segments = build_result_from_faster_whisper(seg_list)
-            elif synth_count:
-                print(f"[whisperx] {synth_count}/{len(result_segments)} segments used synthetic words (alignment failed)")
-        except Exception as e:
-            print(f"[whisperx] Alignment failed: {e}, using faster-whisper words")
+        if skip_align:
+            print("[ab] skip_align=True, using faster-whisper words only")
             result_segments = build_result_from_faster_whisper(seg_list)
+        else:
+            try:
+                aligned_segments = whisperx.align(
+                    seg_list,
+                    align_model,
+                    align_metadata,
+                    tmp_path,
+                    DEVICE,
+                    return_char_alignments=False,
+                )
+                result_segments, ok, synth_count = build_result_from_whisperx(aligned_segments)
+                if not ok or not result_segments:
+                    print("[whisperx] text reconstruction failed; falling back to faster-whisper words")
+                    result_segments = build_result_from_faster_whisper(seg_list)
+                elif synth_count:
+                    print(f"[whisperx] {synth_count}/{len(result_segments)} segments used synthetic words (alignment failed)")
+            except Exception as e:
+                print(f"[whisperx] Alignment failed: {e}, using faster-whisper words")
+                result_segments = build_result_from_faster_whisper(seg_list)
 
         if output == "json":
             return JSONResponse({"text": full_text})
